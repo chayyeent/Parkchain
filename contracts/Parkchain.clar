@@ -19,6 +19,12 @@
 (define-constant ERR_SPACE_ALREADY_EXISTS (err u108))
 (define-constant ERR_INVALID_PRICE_MULTIPLIER (err u109))
 (define-constant ERR_PRICING_DISABLED (err u110))
+(define-constant ERR_VEHICLE_NOT_FOUND (err u111))
+(define-constant ERR_VEHICLE_ALREADY_REGISTERED (err u112))
+(define-constant ERR_INVALID_VEHICLE_TYPE (err u113))
+(define-constant ERR_VEHICLE_NOT_VERIFIED (err u114))
+(define-constant ERR_INCOMPATIBLE_VEHICLE (err u115))
+(define-constant ERR_VEHICLE_LIMIT_EXCEEDED (err u116))
 
 (define-data-var next-space-id uint u1)
 (define-data-var next-pass-id uint u1)
@@ -26,6 +32,9 @@
 (define-data-var dynamic-pricing-enabled bool true)
 (define-data-var surge-multiplier-cap uint u300)
 (define-data-var base-demand-threshold uint u5)
+(define-data-var max-vehicles-per-user uint u10)
+(define-data-var vehicle-verification-fee uint u1000000)
+(define-data-var next-vehicle-id uint u1)
 
 (define-map parking-spaces
   uint
@@ -38,7 +47,10 @@
     dynamic-pricing-enabled: bool,
     surge-multiplier: uint,
     peak-hours-start: uint,
-    peak-hours-end: uint
+    peak-hours-end: uint,
+    allowed-vehicle-types: (list 10 (string-ascii 20)),
+    vehicle-size-limit: uint,
+    height-restriction: uint
   }
 )
 
@@ -49,7 +61,8 @@
     space-id: uint,
     start-block: uint,
     end-block: uint,
-    total-paid: uint
+    total-paid: uint,
+    vehicle-id: (optional uint)
   }
 )
 
@@ -95,6 +108,49 @@
   }
 )
 
+(define-map registered-vehicles
+  uint
+  {
+    owner: principal,
+    license-plate: (string-ascii 20),
+    vehicle-type: (string-ascii 20),
+    make-model: (string-ascii 50),
+    size-category: uint,
+    height: uint,
+    is-verified: bool,
+    verification-block: uint,
+    total-parkings: uint,
+    registration-block: uint
+  }
+)
+
+(define-map user-vehicles
+  principal
+  (list 10 uint)
+)
+
+(define-map vehicle-parking-history
+  uint
+  {
+    total-sessions: uint,
+    total-duration: uint,
+    total-spent: uint,
+    last-parking-block: uint,
+    violation-count: uint,
+    rating-sum: uint,
+    rating-count: uint
+  }
+)
+
+(define-map vehicle-compatibility
+  { vehicle-type: (string-ascii 20), space-id: uint }
+  {
+    is-compatible: bool,
+    price-modifier: uint,
+    special-requirements: (string-ascii 100)
+  }
+)
+
 (define-public (create-parking-space (location (string-ascii 100)) (price-per-hour uint))
   (let
     (
@@ -111,7 +167,10 @@
         dynamic-pricing-enabled: true,
         surge-multiplier: u100,
         peak-hours-start: u8,
-        peak-hours-end: u18
+        peak-hours-end: u18,
+        allowed-vehicle-types: (list "car" "suv" "truck" "motorcycle"),
+        vehicle-size-limit: u300,
+        height-restriction: u200
       }
     )
     (map-set demand-analytics space-id
@@ -134,6 +193,10 @@
 )
 
 (define-public (rent-parking-space (space-id uint) (duration-hours uint))
+  (rent-parking-space-with-vehicle space-id duration-hours none)
+)
+
+(define-public (rent-parking-space-with-vehicle (space-id uint) (duration-hours uint) (vehicle-id (optional uint)))
   (let
     (
       (space (unwrap! (map-get? parking-spaces space-id) ERR_SPACE_NOT_FOUND))
@@ -150,17 +213,24 @@
     (asserts! (> duration-hours u0) ERR_INVALID_DURATION)
     (asserts! (<= duration-hours u24) ERR_INVALID_DURATION)
     (asserts! (get is-available space) ERR_SPACE_NOT_AVAILABLE)
+    (match vehicle-id
+      v-id (try! (validate-vehicle-compatibility v-id space-id))
+      true)
     (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
     (try! (as-contract (stx-transfer? owner-payment tx-sender (get owner space))))
     (try! (nft-mint? parking-pass pass-id tx-sender))
     (unwrap-panic (update-demand-analytics space-id duration-hours total-cost))
+    (match vehicle-id
+      v-id (unwrap-panic (update-vehicle-parking-history v-id duration-hours total-cost))
+      true)
     (map-set active-rentals pass-id
       {
         renter: tx-sender,
         space-id: space-id,
         start-block: current-block,
         end-block: end-block,
-        total-paid: total-cost
+        total-paid: total-cost,
+        vehicle-id: vehicle-id
       }
     )
     (map-set parking-spaces space-id
@@ -657,3 +727,300 @@
     base-demand-threshold: (var-get base-demand-threshold)
   })
 )
+
+(define-public (register-vehicle (license-plate (string-ascii 20)) (vehicle-type (string-ascii 20)) (make-model (string-ascii 50)) (size-category uint) (height uint))
+  (let
+    (
+      (vehicle-id (var-get next-vehicle-id))
+      (user-vehicle-list (default-to (list) (map-get? user-vehicles tx-sender)))
+      (vehicle-count (len user-vehicle-list))
+    )
+    (asserts! (< vehicle-count (var-get max-vehicles-per-user)) ERR_VEHICLE_LIMIT_EXCEEDED)
+    (asserts! (> (len license-plate) u0) ERR_INVALID_VEHICLE_TYPE)
+    (asserts! (> (len vehicle-type) u0) ERR_INVALID_VEHICLE_TYPE)
+    (asserts! (> size-category u0) ERR_INVALID_VEHICLE_TYPE)
+    (asserts! (> height u0) ERR_INVALID_VEHICLE_TYPE)
+    (asserts! (is-none (get-vehicle-by-license-plate license-plate)) ERR_VEHICLE_ALREADY_REGISTERED)
+    (map-set registered-vehicles vehicle-id
+      {
+        owner: tx-sender,
+        license-plate: license-plate,
+        vehicle-type: vehicle-type,
+        make-model: make-model,
+        size-category: size-category,
+        height: height,
+        is-verified: false,
+        verification-block: u0,
+        total-parkings: u0,
+        registration-block: stacks-block-height
+      }
+    )
+    (map-set user-vehicles tx-sender
+      (unwrap-panic (as-max-len? (append user-vehicle-list vehicle-id) u10))
+    )
+    (map-set vehicle-parking-history vehicle-id
+      {
+        total-sessions: u0,
+        total-duration: u0,
+        total-spent: u0,
+        last-parking-block: u0,
+        violation-count: u0,
+        rating-sum: u0,
+        rating-count: u0
+      }
+    )
+    (var-set next-vehicle-id (+ vehicle-id u1))
+    (ok vehicle-id)
+  )
+)
+
+(define-public (verify-vehicle (vehicle-id uint))
+  (let
+    (
+      (vehicle (unwrap! (map-get? registered-vehicles vehicle-id) ERR_VEHICLE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (try! (stx-transfer? (var-get vehicle-verification-fee) (get owner vehicle) (as-contract tx-sender)))
+    (map-set registered-vehicles vehicle-id
+      (merge vehicle {
+        is-verified: true,
+        verification-block: stacks-block-height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-vehicle-info (vehicle-id uint) (make-model (string-ascii 50)) (size-category uint) (height uint))
+  (let
+    (
+      (vehicle (unwrap! (map-get? registered-vehicles vehicle-id) ERR_VEHICLE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner vehicle)) ERR_NOT_AUTHORIZED)
+    (asserts! (> (len make-model) u0) ERR_INVALID_VEHICLE_TYPE)
+    (asserts! (> size-category u0) ERR_INVALID_VEHICLE_TYPE)
+    (asserts! (> height u0) ERR_INVALID_VEHICLE_TYPE)
+    (map-set registered-vehicles vehicle-id
+      (merge vehicle {
+        make-model: make-model,
+        size-category: size-category,
+        height: height
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-vehicle-compatibility (vehicle-type (string-ascii 20)) (space-id uint) (is-compatible bool) (price-modifier uint) (special-requirements (string-ascii 100)))
+  (let
+    (
+      (space (unwrap! (map-get? parking-spaces space-id) ERR_SPACE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner space)) ERR_NOT_OWNER)
+    (asserts! (>= price-modifier u50) ERR_INVALID_PRICE_MULTIPLIER)
+    (asserts! (<= price-modifier u200) ERR_INVALID_PRICE_MULTIPLIER)
+    (map-set vehicle-compatibility { vehicle-type: vehicle-type, space-id: space-id }
+      {
+        is-compatible: is-compatible,
+        price-modifier: price-modifier,
+        special-requirements: special-requirements
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (rate-vehicle-session (vehicle-id uint) (rating uint))
+  (let
+    (
+      (vehicle (unwrap! (map-get? registered-vehicles vehicle-id) ERR_VEHICLE_NOT_FOUND))
+      (history (default-to
+        {
+          total-sessions: u0,
+          total-duration: u0,
+          total-spent: u0,
+          last-parking-block: u0,
+          violation-count: u0,
+          rating-sum: u0,
+          rating-count: u0
+        }
+        (map-get? vehicle-parking-history vehicle-id)
+      ))
+    )
+    (asserts! (>= rating u1) ERR_INVALID_DURATION)
+    (asserts! (<= rating u5) ERR_INVALID_DURATION)
+    (map-set vehicle-parking-history vehicle-id
+      (merge history {
+        rating-sum: (+ (get rating-sum history) rating),
+        rating-count: (+ (get rating-count history) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-max-vehicles-per-user (new-max uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (>= new-max u1) ERR_INVALID_DURATION)
+    (asserts! (<= new-max u20) ERR_INVALID_DURATION)
+    (var-set max-vehicles-per-user new-max)
+    (ok true)
+  )
+)
+
+(define-public (set-vehicle-verification-fee (new-fee uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set vehicle-verification-fee new-fee)
+    (ok true)
+  )
+)
+
+(define-private (validate-vehicle-compatibility (vehicle-id uint) (space-id uint))
+  (let
+    (
+      (vehicle (unwrap! (map-get? registered-vehicles vehicle-id) ERR_VEHICLE_NOT_FOUND))
+      (space (unwrap! (map-get? parking-spaces space-id) ERR_SPACE_NOT_FOUND))
+      (vehicle-type (get vehicle-type vehicle))
+      (vehicle-size (get size-category vehicle))
+      (vehicle-height (get height vehicle))
+      (space-size-limit (get vehicle-size-limit space))
+      (space-height-limit (get height-restriction space))
+      (allowed-types (get allowed-vehicle-types space))
+      (compatibility (map-get? vehicle-compatibility { vehicle-type: vehicle-type, space-id: space-id }))
+    )
+    (asserts! (is-eq tx-sender (get owner vehicle)) ERR_NOT_AUTHORIZED)
+    (asserts! (get is-verified vehicle) ERR_VEHICLE_NOT_VERIFIED)
+    (asserts! (<= vehicle-size space-size-limit) ERR_INCOMPATIBLE_VEHICLE)
+    (asserts! (<= vehicle-height space-height-limit) ERR_INCOMPATIBLE_VEHICLE)
+    (asserts! (is-some (index-of allowed-types vehicle-type)) ERR_INCOMPATIBLE_VEHICLE)
+    (match compatibility
+      comp (asserts! (get is-compatible comp) ERR_INCOMPATIBLE_VEHICLE)
+      true)
+    (ok true)
+  )
+)
+
+(define-private (update-vehicle-parking-history (vehicle-id uint) (duration uint) (cost uint))
+  (let
+    (
+      (history (default-to
+        {
+          total-sessions: u0,
+          total-duration: u0,
+          total-spent: u0,
+          last-parking-block: u0,
+          violation-count: u0,
+          rating-sum: u0,
+          rating-count: u0
+        }
+        (map-get? vehicle-parking-history vehicle-id)
+      ))
+      (vehicle (unwrap! (map-get? registered-vehicles vehicle-id) ERR_VEHICLE_NOT_FOUND))
+    )
+    (map-set vehicle-parking-history vehicle-id
+      (merge history {
+        total-sessions: (+ (get total-sessions history) u1),
+        total-duration: (+ (get total-duration history) duration),
+        total-spent: (+ (get total-spent history) cost),
+        last-parking-block: stacks-block-height
+      })
+    )
+    (map-set registered-vehicles vehicle-id
+      (merge vehicle {
+        total-parkings: (+ (get total-parkings vehicle) u1)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-private (get-vehicle-by-license-plate (license-plate (string-ascii 20)))
+  (fold check-vehicle-license (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20) none)
+)
+
+(define-private (check-vehicle-license (vehicle-id uint) (found (optional uint)))
+  (if (is-some found)
+    found
+    (match (map-get? registered-vehicles vehicle-id)
+      vehicle (if (is-eq (get license-plate vehicle) "target-plate") (some vehicle-id) none)
+      none
+    )
+  )
+)
+
+(define-read-only (get-vehicle-info (vehicle-id uint))
+  (map-get? registered-vehicles vehicle-id)
+)
+
+(define-read-only (get-user-vehicles (user principal))
+  (default-to (list) (map-get? user-vehicles user))
+)
+
+(define-read-only (get-vehicle-parking-history (vehicle-id uint))
+  (map-get? vehicle-parking-history vehicle-id)
+)
+
+(define-read-only (get-vehicle-compatibility (vehicle-type (string-ascii 20)) (space-id uint))
+  (map-get? vehicle-compatibility { vehicle-type: vehicle-type, space-id: space-id })
+)
+
+(define-read-only (get-vehicle-rating (vehicle-id uint))
+  (match (map-get? vehicle-parking-history vehicle-id)
+    history (if (> (get rating-count history) u0)
+              (ok (/ (get rating-sum history) (get rating-count history)))
+              (ok u0))
+    (ok u0)
+  )
+)
+
+(define-read-only (is-vehicle-verified (vehicle-id uint))
+  (match (map-get? registered-vehicles vehicle-id)
+    vehicle (get is-verified vehicle)
+    false
+  )
+)
+
+(define-read-only (check-space-vehicle-compatibility (space-id uint) (vehicle-id uint))
+  (let
+    (
+      (vehicle (unwrap! (map-get? registered-vehicles vehicle-id) ERR_VEHICLE_NOT_FOUND))
+      (space (unwrap! (map-get? parking-spaces space-id) ERR_SPACE_NOT_FOUND))
+      (vehicle-type (get vehicle-type vehicle))
+      (vehicle-size (get size-category vehicle))
+      (vehicle-height (get height vehicle))
+      (space-size-limit (get vehicle-size-limit space))
+      (space-height-limit (get height-restriction space))
+      (allowed-types (get allowed-vehicle-types space))
+      (compatibility (map-get? vehicle-compatibility { vehicle-type: vehicle-type, space-id: space-id }))
+      (size-compatible (<= vehicle-size space-size-limit))
+      (height-compatible (<= vehicle-height space-height-limit))
+      (type-compatible (is-some (index-of allowed-types vehicle-type)))
+      (custom-compatible (match compatibility
+                           comp (get is-compatible comp)
+                           true))
+    )
+    (ok {
+      is-compatible: (and size-compatible height-compatible type-compatible custom-compatible),
+      size-compatible: size-compatible,
+      height-compatible: height-compatible,
+      type-compatible: type-compatible,
+      is-verified: (get is-verified vehicle)
+    })
+  )
+)
+
+(define-read-only (get-vehicle-management-settings)
+  (ok {
+    max-vehicles-per-user: (var-get max-vehicles-per-user),
+    verification-fee: (var-get vehicle-verification-fee),
+    total-registered-vehicles: (- (var-get next-vehicle-id) u1)
+  })
+)
+
+
+
+
+
+
