@@ -25,6 +25,11 @@
 (define-constant ERR_VEHICLE_NOT_VERIFIED (err u114))
 (define-constant ERR_INCOMPATIBLE_VEHICLE (err u115))
 (define-constant ERR_VEHICLE_LIMIT_EXCEEDED (err u116))
+(define-constant ERR_DISPUTE_NOT_FOUND (err u117))
+(define-constant ERR_DISPUTE_ALREADY_RESOLVED (err u118))
+(define-constant ERR_DISPUTE_ALREADY_EXISTS (err u119))
+(define-constant ERR_INVALID_DISPUTE_TYPE (err u120))
+(define-constant ERR_DISPUTE_EXPIRED (err u121))
 
 (define-data-var next-space-id uint u1)
 (define-data-var next-pass-id uint u1)
@@ -35,6 +40,8 @@
 (define-data-var max-vehicles-per-user uint u10)
 (define-data-var vehicle-verification-fee uint u1000000)
 (define-data-var next-vehicle-id uint u1)
+(define-data-var next-dispute-id uint u1)
+(define-data-var dispute-resolution-window uint u1008)
 
 (define-map parking-spaces
   uint
@@ -149,6 +156,33 @@
     price-modifier: uint,
     special-requirements: (string-ascii 100)
   }
+)
+
+(define-map parking-disputes
+  uint
+  {
+    reporter: principal,
+    space-id: uint,
+    rental-pass-id: (optional uint),
+    dispute-type: (string-ascii 30),
+    description: (string-ascii 200),
+    status: (string-ascii 20),
+    created-block: uint,
+    response-block: (optional uint),
+    resolution-block: (optional uint),
+    owner-response: (optional (string-ascii 200)),
+    resolution-notes: (optional (string-ascii 200))
+  }
+)
+
+(define-map user-disputes
+  principal
+  (list 20 uint)
+)
+
+(define-map space-disputes
+  uint
+  (list 10 uint)
 )
 
 (define-public (create-parking-space (location (string-ascii 100)) (price-per-hour uint))
@@ -1016,6 +1050,161 @@
     max-vehicles-per-user: (var-get max-vehicles-per-user),
     verification-fee: (var-get vehicle-verification-fee),
     total-registered-vehicles: (- (var-get next-vehicle-id) u1)
+  })
+)
+
+;; Dispute Resolution System Functions
+
+(define-public (file-dispute (space-id uint) (rental-pass-id (optional uint)) (dispute-type (string-ascii 30)) (description (string-ascii 200)))
+  (let
+    (
+      (dispute-id (var-get next-dispute-id))
+      (space (unwrap! (map-get? parking-spaces space-id) ERR_SPACE_NOT_FOUND))
+      (user-dispute-list (default-to (list) (map-get? user-disputes tx-sender)))
+      (space-dispute-list (default-to (list) (map-get? space-disputes space-id)))
+    )
+    (asserts! (> (len dispute-type) u0) ERR_INVALID_DISPUTE_TYPE)
+    (asserts! (> (len description) u0) ERR_INVALID_DISPUTE_TYPE)
+    (asserts! (< (len user-dispute-list) u20) ERR_VEHICLE_LIMIT_EXCEEDED)
+    (asserts! (< (len space-dispute-list) u10) ERR_VEHICLE_LIMIT_EXCEEDED)
+    ;; Check if user has an existing open dispute for this space
+    (asserts! (is-none (get-user-open-dispute-for-space tx-sender space-id)) ERR_DISPUTE_ALREADY_EXISTS)
+    ;; Validate rental pass if provided
+    (match rental-pass-id
+      pass-id (let ((rental (unwrap! (map-get? active-rentals pass-id) ERR_SPACE_NOT_FOUND)))
+                (asserts! (is-eq (get renter rental) tx-sender) ERR_NOT_AUTHORIZED)
+                (asserts! (is-eq (get space-id rental) space-id) ERR_SPACE_NOT_FOUND))
+      true)
+    (map-set parking-disputes dispute-id
+      {
+        reporter: tx-sender,
+        space-id: space-id,
+        rental-pass-id: rental-pass-id,
+        dispute-type: dispute-type,
+        description: description,
+        status: "open",
+        created-block: stacks-block-height,
+        response-block: none,
+        resolution-block: none,
+        owner-response: none,
+        resolution-notes: none
+      }
+    )
+    (map-set user-disputes tx-sender
+      (unwrap-panic (as-max-len? (append user-dispute-list dispute-id) u20))
+    )
+    (map-set space-disputes space-id
+      (unwrap-panic (as-max-len? (append space-dispute-list dispute-id) u10))
+    )
+    (var-set next-dispute-id (+ dispute-id u1))
+    (ok dispute-id)
+  )
+)
+
+(define-public (respond-to-dispute (dispute-id uint) (response (string-ascii 200)))
+  (let
+    (
+      (dispute (unwrap! (map-get? parking-disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+      (space (unwrap! (map-get? parking-spaces (get space-id dispute)) ERR_SPACE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner space)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-eq (get status dispute) "open") ERR_DISPUTE_ALREADY_RESOLVED)
+    (asserts! (> (len response) u0) ERR_INVALID_DISPUTE_TYPE)
+    (asserts! (< (+ (get created-block dispute) (var-get dispute-resolution-window)) stacks-block-height) ERR_DISPUTE_EXPIRED)
+    (map-set parking-disputes dispute-id
+      (merge dispute {
+        status: "responded",
+        response-block: (some stacks-block-height),
+        owner-response: (some response)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution-notes (string-ascii 200)))
+  (let
+    (
+      (dispute (unwrap! (map-get? parking-disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (not (is-eq (get status dispute) "resolved")) ERR_DISPUTE_ALREADY_RESOLVED)
+    (asserts! (> (len resolution-notes) u0) ERR_INVALID_DISPUTE_TYPE)
+    (map-set parking-disputes dispute-id
+      (merge dispute {
+        status: "resolved",
+        resolution-block: (some stacks-block-height),
+        resolution-notes: (some resolution-notes)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-dispute-resolution-window (new-window uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (>= new-window u144) ERR_INVALID_DURATION)
+    (asserts! (<= new-window u14400) ERR_INVALID_DURATION)
+    (var-set dispute-resolution-window new-window)
+    (ok true)
+  )
+)
+
+(define-private (get-user-open-dispute-for-space (user principal) (space-id uint))
+  (let
+    (
+      (user-disputes-list (default-to (list) (map-get? user-disputes user)))
+    )
+    (get found (fold check-open-dispute-for-space user-disputes-list { space-id: space-id, found: none }))
+  )
+)
+
+(define-private (check-open-dispute-for-space (dispute-id uint) (params { space-id: uint, found: (optional uint) }))
+  (if (is-some (get found params))
+    params
+    (match (map-get? parking-disputes dispute-id)
+      dispute (if (and (is-eq (get space-id dispute) (get space-id params))
+                       (or (is-eq (get status dispute) "open")
+                           (is-eq (get status dispute) "responded")))
+                { space-id: (get space-id params), found: (some dispute-id) }
+                params)
+      params
+    )
+  )
+)
+
+;; Read-only functions for dispute resolution
+
+(define-read-only (get-dispute-info (dispute-id uint))
+  (map-get? parking-disputes dispute-id)
+)
+
+(define-read-only (get-user-disputes (user principal))
+  (default-to (list) (map-get? user-disputes user))
+)
+
+(define-read-only (get-space-disputes (space-id uint))
+  (default-to (list) (map-get? space-disputes space-id))
+)
+
+(define-read-only (get-dispute-status (dispute-id uint))
+  (match (map-get? parking-disputes dispute-id)
+    dispute (ok {
+      status: (get status dispute),
+      is-expired: (> stacks-block-height (+ (get created-block dispute) (var-get dispute-resolution-window))),
+      blocks-remaining: (if (> (+ (get created-block dispute) (var-get dispute-resolution-window)) stacks-block-height)
+                          (- (+ (get created-block dispute) (var-get dispute-resolution-window)) stacks-block-height)
+                          u0)
+    })
+    ERR_DISPUTE_NOT_FOUND
+  )
+)
+
+(define-read-only (get-dispute-resolution-settings)
+  (ok {
+    resolution-window-blocks: (var-get dispute-resolution-window),
+    total-disputes: (- (var-get next-dispute-id) u1)
   })
 )
 
